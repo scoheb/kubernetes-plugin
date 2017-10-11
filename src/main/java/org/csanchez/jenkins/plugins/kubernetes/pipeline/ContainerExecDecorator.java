@@ -236,7 +236,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     if (cmdEnvs != null) {
                         for (String cmdEnv : cmdEnvs) {
                             watch.getInput().write(
-                                    String.format("export \"%s\"%s", cmdEnv.replace("\"", "\\\""), NEWLINE).getBytes(StandardCharsets.UTF_8));
+                                    String.format("export \"%s\"%s", StringEscapeUtils.escapeJava(cmdEnv), NEWLINE).getBytes(StandardCharsets.UTF_8));
                         }
                     }
 
