@@ -235,8 +235,13 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     //setup specific command envs passed into cmd
                     if (cmdEnvs != null) {
                         for (String cmdEnv : cmdEnvs) {
+                            String[] cmdEnvArr = cmdEnv.split("=");
+                            String cmdEnvKey = cmdEnvArr[0].replaceAll("\\.", "");
+                            String cmdEnvVal = cmdEnvArr[1];
+                            String cmdEnvFixed = cmdEnvKey + "=" + cmdEnvVal;
+
                             watch.getInput().write(
-                                    String.format("export \"%s\"%s", StringEscapeUtils.escapeJava(cmdEnv), NEWLINE).getBytes(StandardCharsets.UTF_8));
+                                    String.format("export \"%s\"%s", StringEscapeUtils.escapeJava(cmdEnvFixed), NEWLINE).getBytes(StandardCharsets.UTF_8));
                         }
                     }
 
@@ -271,7 +276,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
             {
                 for (Map.Entry<String, String> entry : vars.entrySet()) {
                          watch.getInput().write(
-                                 String.format("export %s=\"%s\"%s", entry.getKey(), StringEscapeUtils.escapeJava(entry.getValue()), NEWLINE).getBytes(StandardCharsets.UTF_8));
+                                 String.format("export %s=\"%s\"%s", entry.getKey().replaceAll("\\.", "_"), StringEscapeUtils.escapeJava(entry.getValue()), NEWLINE).getBytes(StandardCharsets.UTF_8));
                      }
             }
 
