@@ -244,10 +244,11 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
             private void setupEnvironmentVariable(EnvVars vars, ExecWatch watch) throws IOException
             {
                 for (Map.Entry<String, String> entry : vars.entrySet()) {
+                    String escapedKey = entry.getKey().replaceAll("\\.", "_").replaceAll("-", "_");
                     watch.getInput().write(
                             String.format(
                                     "export %s='%s'%s",
-                                    entry.getKey(),
+                                    escapedKey,
                                     entry.getValue().replace("'", "'\\''"),
                                     NEWLINE
                             ).getBytes(StandardCharsets.UTF_8)
