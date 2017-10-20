@@ -88,31 +88,34 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
     private final String containerName;
     private final EnvironmentExpander environmentExpander;
 
-    public ContainerExecDecorator(KubernetesClient client, String podName, String containerName, String namespace, EnvironmentExpander environmentExpander) {
+    private final FilePath ws;
+
+    public ContainerExecDecorator(KubernetesClient client, String podName, String containerName, String namespace, EnvironmentExpander environmentExpander, FilePath ws) {
         this.client = client;
         this.podName = podName;
         this.namespace = namespace;
         this.containerName = containerName;
         this.environmentExpander = environmentExpander;
+        this.ws = ws;
     }
 
     public ContainerExecDecorator(KubernetesClient client, String podName, String containerName, String namespace) {
-        this(client, podName, containerName, namespace, null);
+        this(client, podName, containerName, namespace, null, null);
     }
 
     @Deprecated
     public ContainerExecDecorator(KubernetesClient client, String podName, String containerName, AtomicBoolean alive, CountDownLatch started, CountDownLatch finished, String namespace) {
-        this(client, podName, containerName, namespace, null);
+        this(client, podName, containerName, namespace, null, null);
     }
 
     @Deprecated
     public ContainerExecDecorator(KubernetesClient client, String podName, String containerName, AtomicBoolean alive, CountDownLatch started, CountDownLatch finished) {
-        this(client, podName, containerName, null, null);
+        this(client, podName, containerName, (String) null, null, null);
     }
 
     @Deprecated
     public ContainerExecDecorator(KubernetesClient client, String podName, String containerName, String path, AtomicBoolean alive, CountDownLatch started, CountDownLatch finished) {
-        this(client, podName, containerName, null, null);
+        this(client, podName, containerName, (String) null, null, null);
     }
 
     @Override
@@ -180,14 +183,11 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     printStream = new PrintStream(stream, false, StandardCharsets.UTF_8.toString());
                 }
 
-                //we need to keep the pid of the command
-                PidOutputStream pidOutputStream = new PidOutputStream();
-
                 // we need to keep the last bytes in the stream to parse the exit code as it is printed there
                 // so we use a buffer
                 ExitCodeOutputStream exitCodeOutputStream = new ExitCodeOutputStream();
                 // send container output to all 3 streams (pid, out, job).
-                stream = new TeeOutputStream(pidOutputStream, new TeeOutputStream(exitCodeOutputStream, stream));
+                stream = new TeeOutputStream(exitCodeOutputStream, stream);
 
                 String msg = "Executing shell script inside container [" + containerName + "] of pod [" + podName + "]";
                 LOGGER.log(Level.FINEST, msg);
@@ -263,8 +263,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
                     doExec(watch, printStream, commands);
 
-
-                    int pid = pidOutputStream.getPid();
+                    int pid = pid(commands);
                     ContainerExecProc proc = new ContainerExecProc(pid, watch, alive, finished, exitCodeOutputStream::getExitCode);
                     processes.put(pid, proc);
                     closables.add(proc);
@@ -293,10 +292,11 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
             private void setupEnvironmentVariable(EnvVars vars, ExecWatch watch) throws IOException {
                 for (Map.Entry<String, String> entry : vars.entrySet()) {
+                    String escapedKey = entry.getKey().replaceAll("\\.", "_").replaceAll("-", "_");
                     watch.getInput().write(
                             String.format(
                                     "export %s='%s'%s",
-                                    entry.getKey(),
+                                    escapedKey,
                                     entry.getValue().replace("'", "'\\''"),
                                     NEWLINE
                             ).getBytes(StandardCharsets.UTF_8)
@@ -360,9 +360,9 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
 
             for (String stmt : statements) {
-                if (stmt.startsWith("echo \\$\\$ >")) {
-                    stmt = PidOutputStream.PID_COMMAND + stmt;
-                }
+                //if (stmt.startsWith("echo \\$\\$ >")) {
+                //    stmt = PidOutputStream.PID_COMMAND + stmt;
+                //}
                 String s = String.format("\"%s\" ", stmt);
                 sb.append(s);
                 out.print(s);
@@ -399,6 +399,26 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
         return -1;
     }
 
+    static String readPidFile(String... commands) {
+        if (commands.length >= 4 && "nohup".equals(commands[0]) && "sh".equals(commands[1]) && commands[2].equals("-c") && commands[3].startsWith("echo \\$\\$ >")) {
+            return commands[3].substring(13, commands[3].indexOf(";") - 1);
+        }
+        return null;
+    }
+
+    private synchronized int pid(String... commands) throws IOException, InterruptedException {
+        int pid = -1;
+                FilePath pidFile = ws.child(readPidFile(commands));
+                if (pidFile.exists()) {
+                    try {
+                        pid = Integer.parseInt(pidFile.readToString().trim());
+                    } catch (NumberFormatException x) {
+                        throw new IOException("corrupted content in " + pidFile + ": " + x, x);
+                    }
+                }
+            return pid;
+        }
+
     static String[] getCommands(Launcher.ProcStarter starter) {
         List<String> allCommands = new ArrayList<String>();
 
@@ -423,50 +443,6 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
             watch.close();
         } catch (Exception e) {
             LOGGER.log(Level.INFO, "failed to close watch", e);
-        }
-    }
-
-    static class PidOutputStream extends OutputStream {
-        public static final String PID_COMMAND_TXT = "PID";
-        public static final String PID_COMMAND = "echo " + PID_COMMAND_TXT+"$$.;";
-
-        private static final int SIZE = 12;
-
-        private final Queue<Integer> queue = new LinkedList<>();
-        private final CountDownLatch countDownLatch = new CountDownLatch(SIZE);
-
-        @Override
-        public void write(int b) throws IOException {
-            if (queue.size() < SIZE) {
-                queue.add(b);
-                countDownLatch.countDown();
-            }
-        }
-
-        public int getPid() {
-            try {
-                countDownLatch.await(10, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-               //Just ignore.
-            }
-            ByteBuffer b = ByteBuffer.allocate(SIZE);
-            queue.stream().filter(Objects::nonNull).forEach((i) -> b.put((byte) i.intValue()));
-            int result = -1;
-            String s = new String(b.array(), StandardCharsets.UTF_8);
-            int index = s.indexOf(PID_COMMAND_TXT);
-
-            if (index < 0) {
-                return result;
-            }
-
-            s = s.substring(index + PID_COMMAND_TXT.length(), s.indexOf('.'));
-            try {
-                result = Integer.parseInt(s.trim());
-            } catch (NumberFormatException e) {
-                LOGGER.log(Level.WARNING, "Unable to parse pid as integer: \"{0}\" {1} / {2}",
-                        new Object[]{s, queue.toString(), Arrays.toString(b.array())});
-            }
-            return result;
         }
     }
 
