@@ -30,11 +30,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Queue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -134,7 +132,40 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                 //check if its the actual script or the ProcessLiveness check.
                 int p = parsePid(commands);
                 //if it is a liveness check, try to find the actual process to avoid doing multiple execs.
-                if (p > 0 && processes.containsKey(p)) {
+                if (p == 9999) {
+                    return new Proc() {
+                        @Override
+                        public boolean isAlive() throws IOException, InterruptedException {
+                            return false;
+                        }
+
+                        @Override
+                        public void kill() throws IOException, InterruptedException {
+
+                        }
+
+                        @Override
+                        public int join() throws IOException, InterruptedException {
+                            return 0;
+                        }
+
+                        @Override
+                        public InputStream getStdout() {
+                            return null;
+                        }
+
+                        @Override
+                        public InputStream getStderr() {
+                            return null;
+                        }
+
+                        @Override
+                        public OutputStream getStdin() {
+                            return null;
+                        }
+                    };
+                } else if (p > 0 && processes.containsKey(p)) {
+                    LOGGER.log(Level.INFO, "Retrieved process from cache with pid:[ " + p +"].");
                     Proc proc = processes.get(p);
                     return new Proc() {
 
@@ -264,6 +295,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     doExec(watch, printStream, commands);
 
                     int pid = pid(commands);
+                    LOGGER.log(Level.INFO, "Created process inside pod: ["+podName+"], container: ["+containerName+"] with pid:["+pid+"]");
                     ContainerExecProc proc = new ContainerExecProc(pid, watch, alive, finished, exitCodeOutputStream::getExitCode);
                     processes.put(pid, proc);
                     closables.add(proc);
@@ -351,18 +383,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
         try {
             out.print("Executing command: ");
             StringBuilder sb = new StringBuilder();
-
-            // get the command exit code and print it padded so it is easier to parse in ContainerExecProc
-            // We need to exit so that we know when the command has finished.
-            //sb.append(PidOutputStream.PID_COMMAND);
-            //out.print(PidOutputStream.PID_COMMAND);
-            //watch.getInput().write(PidOutputStream.PID_COMMAND.getBytes(StandardCharsets.UTF_8));
-
-
             for (String stmt : statements) {
-                //if (stmt.startsWith("echo \\$\\$ >")) {
-                //    stmt = PidOutputStream.PID_COMMAND + stmt;
-                //}
                 String s = String.format("\"%s\" ", stmt);
                 sb.append(s);
                 out.print(s);
@@ -408,16 +429,24 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
     private synchronized int pid(String... commands) throws IOException, InterruptedException {
         int pid = -1;
-                FilePath pidFile = ws.child(readPidFile(commands));
-                if (pidFile.exists()) {
-                    try {
-                        pid = Integer.parseInt(pidFile.readToString().trim());
-                    } catch (NumberFormatException x) {
-                        throw new IOException("corrupted content in " + pidFile + ": " + x, x);
-                    }
-                }
-            return pid;
+        FilePath pidFile = ws.child(readPidFile(commands));
+        for (int w = 0; w < 10 && !pidFile.exists(); w++) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.interrupted();
+                break;
+            }
         }
+        if (pidFile.exists()) {
+            try {
+                pid = Integer.parseInt(pidFile.readToString().trim());
+            } catch (NumberFormatException x) {
+                throw new IOException("corrupted content in " + pidFile + ": " + x, x);
+            }
+        }
+        return pid;
+    }
 
     static String[] getCommands(Launcher.ProcStarter starter) {
         List<String> allCommands = new ArrayList<String>();
