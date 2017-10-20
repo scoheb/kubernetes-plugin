@@ -146,7 +146,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
                         @Override
                         public int join() throws IOException, InterruptedException {
-                            return 0;
+                            return 1;
                         }
 
                         @Override
