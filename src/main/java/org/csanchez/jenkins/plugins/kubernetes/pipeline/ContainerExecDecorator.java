@@ -20,6 +20,7 @@ import static org.csanchez.jenkins.plugins.kubernetes.pipeline.Constants.*;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
@@ -28,9 +29,12 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Queue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -62,7 +66,6 @@ import org.jenkinsci.plugins.workflow.steps.EnvironmentExpander;
 /**
  * This decorator interacts directly with the Kubernetes exec API to run commands inside a container. It does not use
  * the Jenkins slave to execute commands.
- *
  */
 public class ContainerExecDecorator extends LauncherDecorator implements Serializable, Closeable {
 
@@ -77,6 +80,9 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
     @SuppressFBWarnings(value = "SE_TRANSIENT_FIELD_NOT_RESTORED", justification = "not needed on deserialization")
     private final transient List<Closeable> closables = new ArrayList<>();
+    @SuppressFBWarnings(value = "SE_TRANSIENT_FIELD_NOT_RESTORED", justification = "not needed on deserialization")
+    private final transient Map<Integer, ContainerExecProc> processes = new HashMap<Integer, ContainerExecProc>();
+
     private final String podName;
     private final String namespace;
     private final String containerName;
@@ -122,6 +128,44 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
             }
 
             private Proc doLaunch(boolean quiet, FilePath pwd, String... commands) throws IOException {
+                //check if its the actual script or the ProcessLiveness check.
+                int p = parsePid(commands);
+                //if it is a liveness check, try to find the actual process to avoid doing multiple execs.
+                if (p > 0 && processes.containsKey(p)) {
+                    Proc proc = processes.get(p);
+                    return new Proc() {
+
+                        @Override
+                        public boolean isAlive() throws IOException, InterruptedException {
+                            return false;
+                        }
+
+                        @Override
+                        public void kill() throws IOException, InterruptedException {
+                        }
+
+                        @Override
+                        public int join() throws IOException, InterruptedException {
+                            return proc.isAlive() ? 0 : -1;
+                        }
+
+                        @Override
+                        public InputStream getStdout() {
+                            return null;
+                        }
+
+                        @Override
+                        public InputStream getStderr() {
+                            return null;
+                        }
+
+                        @Override
+                        public OutputStream getStdin() {
+                            return null;
+                        }
+                    };
+                }
+
                 waitUntilContainerIsReady();
 
                 final CountDownLatch started = new CountDownLatch(1);
@@ -136,11 +180,14 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     printStream = new PrintStream(stream, false, StandardCharsets.UTF_8.toString());
                 }
 
+                //we need to keep the pid of the command
+                PidOutputStream pidOutputStream = new PidOutputStream();
+
                 // we need to keep the last bytes in the stream to parse the exit code as it is printed there
                 // so we use a buffer
                 ExitCodeOutputStream exitCodeOutputStream = new ExitCodeOutputStream();
-                // send container output both to the job output and our buffer
-                stream = new TeeOutputStream(exitCodeOutputStream, stream);
+                // send container output to all 3 streams (pid, out, job).
+                stream = new TeeOutputStream(pidOutputStream, new TeeOutputStream(exitCodeOutputStream, stream));
 
                 String msg = "Executing shell script inside container [" + containerName + "] of pod [" + podName + "]";
                 LOGGER.log(Level.FINEST, msg);
@@ -216,10 +263,13 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
                     doExec(watch, printStream, commands);
 
-                    ContainerExecProc proc = new ContainerExecProc(watch, alive, finished, exitCodeOutputStream::getExitCode);
+
+                    int pid = pidOutputStream.getPid();
+                    ContainerExecProc proc = new ContainerExecProc(pid, watch, alive, finished, exitCodeOutputStream::getExitCode);
+                    processes.put(pid, proc);
                     closables.add(proc);
                     return proc;
-                }  catch (InterruptedException ie) {
+                } catch (InterruptedException ie) {
                     throw new InterruptedIOException(ie.getMessage());
                 } catch (Exception e) {
                     closeWatch(watch);
@@ -235,14 +285,13 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
 
                 int exitCode = doLaunch(
                         true, null,
-                        "sh", "-c", "kill \\`grep -l '" + COOKIE_VAR + "=" + cookie  +"' /proc/*/environ | cut -d / -f 3 \\`"
+                        "sh", "-c", "kill \\`grep -l '" + COOKIE_VAR + "=" + cookie + "' /proc/*/environ | cut -d / -f 3 \\`"
                 ).join();
 
                 getListener().getLogger().println("kill finished with exit code " + exitCode);
             }
 
-            private void setupEnvironmentVariable(EnvVars vars, ExecWatch watch) throws IOException
-            {
+            private void setupEnvironmentVariable(EnvVars vars, ExecWatch watch) throws IOException {
                 for (Map.Entry<String, String> entry : vars.entrySet()) {
                     watch.getInput().write(
                             String.format(
@@ -254,7 +303,6 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                     );
                 }
             }
-
 
 
             private void waitUntilContainerIsReady() throws IOException {
@@ -303,7 +351,18 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
         try {
             out.print("Executing command: ");
             StringBuilder sb = new StringBuilder();
+
+            // get the command exit code and print it padded so it is easier to parse in ContainerExecProc
+            // We need to exit so that we know when the command has finished.
+            //sb.append(PidOutputStream.PID_COMMAND);
+            //out.print(PidOutputStream.PID_COMMAND);
+            //watch.getInput().write(PidOutputStream.PID_COMMAND.getBytes(StandardCharsets.UTF_8));
+
+
             for (String stmt : statements) {
+                if (stmt.startsWith("echo \\$\\$ >")) {
+                    stmt = PidOutputStream.PID_COMMAND + stmt;
+                }
                 String s = String.format("\"%s\" ", stmt);
                 sb.append(s);
                 out.print(s);
@@ -326,6 +385,18 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
             e.printStackTrace(out);
             throw new RuntimeException(e);
         }
+    }
+
+    static int parsePid(String... commands) {
+        if (commands.length == 4 && "ps".equals(commands[0]) && "-o".equals(commands[1]) && commands[2].equals("pid=")) {
+            return Integer.parseInt(commands[3]);
+        }
+
+
+        if (commands.length == 4 && "ps".equals(commands[0]) && "-o".equals(commands[1]) && commands[2].startsWith("-pid")) {
+            return Integer.parseInt(commands[3]);
+        }
+        return -1;
     }
 
     static String[] getCommands(Launcher.ProcStarter starter) {
@@ -352,6 +423,50 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
             watch.close();
         } catch (Exception e) {
             LOGGER.log(Level.INFO, "failed to close watch", e);
+        }
+    }
+
+    static class PidOutputStream extends OutputStream {
+        public static final String PID_COMMAND_TXT = "PID";
+        public static final String PID_COMMAND = "echo " + PID_COMMAND_TXT+"$$.;";
+
+        private static final int SIZE = 12;
+
+        private final Queue<Integer> queue = new LinkedList<>();
+        private final CountDownLatch countDownLatch = new CountDownLatch(SIZE);
+
+        @Override
+        public void write(int b) throws IOException {
+            if (queue.size() < SIZE) {
+                queue.add(b);
+                countDownLatch.countDown();
+            }
+        }
+
+        public int getPid() {
+            try {
+                countDownLatch.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+               //Just ignore.
+            }
+            ByteBuffer b = ByteBuffer.allocate(SIZE);
+            queue.stream().filter(Objects::nonNull).forEach((i) -> b.put((byte) i.intValue()));
+            int result = -1;
+            String s = new String(b.array(), StandardCharsets.UTF_8);
+            int index = s.indexOf(PID_COMMAND_TXT);
+
+            if (index < 0) {
+                return result;
+            }
+
+            s = s.substring(index + PID_COMMAND_TXT.length(), s.indexOf('.'));
+            try {
+                result = Integer.parseInt(s.trim());
+            } catch (NumberFormatException e) {
+                LOGGER.log(Level.WARNING, "Unable to parse pid as integer: \"{0}\" {1} / {2}",
+                        new Object[]{s, queue.toString(), Arrays.toString(b.array())});
+            }
+            return result;
         }
     }
 
@@ -384,7 +499,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
             int i = 1;
             String s = new String(b.array(), StandardCharsets.UTF_8);
             if (s.indexOf(EXIT_COMMAND_TXT) < 0) {
-                LOGGER.log(Level.WARNING, "Unable to find \"{0}\" in {1}", new Object[] { EXIT_COMMAND_TXT, s });
+                LOGGER.log(Level.WARNING, "Unable to find \"{0}\" in {1}", new Object[]{EXIT_COMMAND_TXT, s});
                 return i;
             }
             // parse the exitcode int printed after EXITCODE
@@ -394,7 +509,7 @@ public class ContainerExecDecorator extends LauncherDecorator implements Seriali
                 i = Integer.parseInt(s);
             } catch (NumberFormatException e) {
                 LOGGER.log(Level.WARNING, "Unable to parse exit code as integer: \"{0}\" {1} / {2}",
-                        new Object[] { s, queue.toString(), Arrays.toString(b.array()) });
+                        new Object[]{s, queue.toString(), Arrays.toString(b.array())});
             }
             return i;
         }
